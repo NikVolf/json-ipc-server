@@ -49,11 +49,13 @@ use std::sync::*;
 use std::sync::atomic::*;
 use std;
 use slab;
+use validator;
 #[cfg(test)]
 use tests;
 
 const SERVER: Token = Token(0);
 const MAX_CONCURRENT_CONNECTIONS: usize = 16;
+const MAX_WRITE_LENGTH: usize = 8192;
 
 struct SocketConnection {
     socket: UnixStream,
@@ -70,7 +72,7 @@ impl SocketConnection {
         SocketConnection {
             socket: sock,
             buf: None,
-            mut_buf: Some(ByteBuf::mut_with_capacity(2048)),
+            mut_buf: Some(ByteBuf::mut_with_capacity(4096)),
             token: None,
             interest: EventSet::hup(),
         }
@@ -79,11 +81,16 @@ impl SocketConnection {
     fn writable(&mut self, event_loop: &mut EventLoop<RpcServer>, _handler: &IoHandler) -> io::Result<()> {
         use std::io::Write;
         if let Some(buf) = self.buf.take() {
-            try!(self.socket.write_all(&buf.bytes()));
+			if buf.remaining() < MAX_WRITE_LENGTH {
+	            try!(self.socket.write_all(&buf.bytes()));
+				self.interest.remove(EventSet::writable());
+				self.interest.insert(EventSet::readable());
+			}
+			else {
+				try!(self.socket.write_all(&buf.bytes()[0..MAX_WRITE_LENGTH]));
+				self.buf = Some(ByteBuf::from_slice(&buf.bytes()[MAX_WRITE_LENGTH..]));
+			}
         }
-
-        self.interest.remove(EventSet::writable());
-        self.interest.insert(EventSet::readable());
 
         event_loop.reregister(&self.socket, self.token.unwrap(), self.interest, PollOpt::edge() | PollOpt::oneshot())
     }
@@ -96,22 +103,32 @@ impl SocketConnection {
                 self.mut_buf = Some(buf);
             }
             Ok(Some(_)) => {
-                String::from_utf8(buf.bytes().to_vec())
-                    .map(|rpc_msg| {
+                let (requests, last_index) = validator::extract_requests(buf.bytes());
+                if requests.len() > 0 {
+                    let mut response_bytes = Vec::new();
+                    for rpc_msg in requests {
+                        trace!(target: "ipc", "Request: {}", rpc_msg);
                         let response: Option<String> = handler.handle_request(&rpc_msg);
                         if let Some(response_str) = response {
-                            let response_bytes = response_str.into_bytes();
-                            self.buf = Some(ByteBuf::from_slice(&response_bytes));
+                            trace!(target: "ipc", "Response: {}", &response_str);
+                            response_bytes.extend(response_str.into_bytes());
                         }
-                    }).unwrap();
+                    }
+                    self.buf = Some(ByteBuf::from_slice(&response_bytes[..]));
 
-                self.mut_buf = Some(ByteBuf::mut_with_capacity(2048));
+                    let mut new_buf = ByteBuf::mut_with_capacity(4096);
+                    new_buf.write_slice(&buf.bytes()[last_index+1..]);
+                    self.mut_buf = Some(new_buf);
 
-                self.interest.remove(EventSet::readable());
-                self.interest.insert(EventSet::writable());
+                    self.interest.remove(EventSet::readable());
+                    self.interest.insert(EventSet::writable());
+                }
+                else {
+                    self.mut_buf = Some(buf);
+                }
             }
-            Err(_) => {
-                //warn!(target: "ipc", "Error receiving data: {:?}", e);
+            Err(e) => {
+                trace!(target: "ipc", "Error receiving data: {:?}", e);
                 self.interest.remove(EventSet::readable());
             }
 
